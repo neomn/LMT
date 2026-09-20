@@ -1,0 +1,124 @@
+services:
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - xpack.security.enrollment.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.15.0
+    environment:
+      ELASTICSEARCH_HOSTS: http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  logstash:
+    image: docker.elastic.co/logstash/logstash:8.15.0
+    environment:
+      LS_JAVA_OPTS: -Xms256m -Xmx256m
+      XPACK_MONITORING_ENABLED: "false"
+    ports:
+      - "5044:5044"
+    volumes:
+      - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "14317:4317"
+      - "14318:4318"
+
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.108.0
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4319:4317"
+      - "4320:4318"
+      - "8889:8889"
+    depends_on:
+      jaeger:
+        condition: service_started
+
+  account-service:
+    build: ./banking-app
+    environment:
+      SERVICE_NAME: account-service
+      SERVICE_PORT: "8081"
+      LOGSTASH_HOST: logstash
+      LOGSTASH_PORT: "5044"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: account-service
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=observability-lab,service.version=1.0.0
+    command: ["python", "app.py", "account"]
+    ports:
+      - "18081:8081"
+    depends_on:
+      otel-collector:
+        condition: service_started
+      logstash:
+        condition: service_started
+
+  payment-service:
+    build: ./banking-app
+    environment:
+      SERVICE_NAME: payment-service
+      SERVICE_PORT: "8082"
+      ACCOUNT_SERVICE_URL: http://account-service:8081
+      LOGSTASH_HOST: logstash
+      LOGSTASH_PORT: "5044"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: payment-service
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=observability-lab,service.version=1.0.0
+    command: ["python", "app.py", "payment"]
+    ports:
+      - "18082:8082"
+    depends_on:
+      account-service:
+        condition: service_started
+      otel-collector:
+        condition: service_started
+      logstash:
+        condition: service_started
+
+  traffic-generator:
+    build: ./banking-app
+    environment:
+      ACCOUNT_SERVICE_URL: http://account-service:8081
+      PAYMENT_SERVICE_URL: http://payment-service:8082
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_SERVICE_NAME: traffic-generator
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=observability-lab,service.version=1.0.0
+      LOGSTASH_HOST: logstash
+      LOGSTASH_PORT: "5044"
+    command: ["python", "app.py", "traffic"]
+    depends_on:
+      account-service:
+        condition: service_started
+      payment-service:
+        condition: service_started
+
+volumes:
+  elasticsearch-data:
