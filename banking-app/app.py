@@ -1,12 +1,10 @@
 import json
-import logging
 import os
 import random
 import socket
 import sys
-import threading
-import time
 
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -23,17 +21,22 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 SERVICE_NAME = os.getenv("OTEL_SERVICE_NAME", os.getenv("SERVICE_NAME", "banking-service"))
+TEAM = os.getenv("TEAM", "unknown")
+SERVICE_ROLE = os.getenv("SERVICE_ROLE", "microservice")
+SERVICE_PORT = int(os.getenv("SERVICE_PORT", "8080"))
 OTLP_ENDPOINT = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
 LOGSTASH_HOST = os.getenv("LOGSTASH_HOST", "localhost")
 LOGSTASH_PORT = int(os.getenv("LOGSTASH_PORT", "5044"))
+DEPENDENCIES = [item.strip() for item in os.getenv("SERVICE_DEPENDENCIES", "").split(",") if item.strip()]
+TARGETS = [item.strip() for item in os.getenv("TARGETS", "").split(",") if item.strip()]
 
-# The exporters are configured in the application so every service emits OTLP
-# without needing a sidecar. The Collector remains the central routing point.
 resource = Resource.create(
     {
         "service.name": SERVICE_NAME,
         "service.version": "1.0.0",
         "deployment.environment": "observability-lab",
+        "bank.team": TEAM,
+        "bank.service_role": SERVICE_ROLE,
     }
 )
 tracer_provider = TracerProvider(resource=resource)
@@ -54,7 +57,10 @@ request_duration = meter.create_histogram(
     "banking_request_duration_ms", unit="ms", description="Banking API duration"
 )
 transaction_counter = meter.create_counter(
-    "banking_transactions_total", description="Banking transactions by result"
+    "banking_transactions_total", description="Simulated banking transactions"
+)
+dependency_counter = meter.create_counter(
+    "banking_dependency_calls_total", description="Downstream dependency calls"
 )
 
 RequestsInstrumentor().instrument()
@@ -65,6 +71,8 @@ def log_event(level, message, **fields):
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "level": level,
         "service": SERVICE_NAME,
+        "team": TEAM,
+        "service_role": SERVICE_ROLE,
         "message": message,
         "trace_id": format(trace.get_current_span().get_span_context().trace_id, "032x"),
         **fields,
@@ -74,30 +82,46 @@ def log_event(level, message, **fields):
         with socket.create_connection((LOGSTASH_HOST, LOGSTASH_PORT), timeout=1) as connection:
             connection.sendall(payload)
     except OSError:
-        # Logging must not take down a banking request while Logstash starts/restarts.
         pass
     print(json.dumps(event), flush=True)
 
 
-accounts = {
-    "alice": {"balance": 12000.0, "currency": "USD"},
-    "bob": {"balance": 7500.0, "currency": "USD"},
-    "carol": {"balance": 3200.0, "currency": "USD"},
-}
-account_lock = threading.Lock()
-
-
 def simulated_latency(operation):
-    # A small tail-latency population makes bottleneck detection realistic.
     if random.random() < 0.08:
         delay = random.uniform(0.8, 2.5)
-        log_event("WARN", "slow dependency simulation", operation=operation, delay_ms=round(delay * 1000))
+        log_event("WARN", "simulated tail latency", operation=operation, delay_ms=round(delay * 1000))
         time.sleep(delay)
     else:
         time.sleep(random.uniform(0.01, 0.08))
 
 
-def create_app(mode):
+
+def process_dependencies(payload):
+    visited = set(payload.get("visited", []))
+    candidates = [dependency for dependency in DEPENDENCIES if dependency not in visited]
+    if not candidates or len(visited) >= 10:
+        return [], []
+
+    # Keep fanout bounded so a single scenario creates a useful but manageable trace.
+    fanout = min(len(candidates), 2 if SERVICE_ROLE in {"entry-point", "orchestrator", "gateway"} else 1)
+    selected = random.sample(candidates, fanout)
+    responses = []
+    failures = []
+    for dependency in selected:
+        target = f"http://{dependency}:8080"
+        dependency_counter.add(1, {"dependency": dependency, "team": TEAM})
+        try:
+            response = requests.post(f"{target}/process", json=payload, timeout=4)
+            responses.append({"service": dependency, "status_code": response.status_code})
+            if response.status_code >= 500:
+                failures.append(dependency)
+        except requests.RequestException as exc:
+            failures.append(dependency)
+            log_event("WARN", "dependency call failed", dependency=dependency, error=str(exc))
+    return responses, failures
+
+
+def create_app():
     app = Flask(SERVICE_NAME)
     FlaskInstrumentor().instrument_app(app)
 
@@ -108,110 +132,123 @@ def create_app(mode):
     @app.after_request
     def record_request(response):
         duration_ms = (time.perf_counter() - request._started_at) * 1000
-        attributes = {"http.method": request.method, "http.route": request.path, "http.status_code": response.status_code}
+        attributes = {
+            "http.method": request.method,
+            "http.route": request.path,
+            "http.status_code": response.status_code,
+            "bank.team": TEAM,
+        }
         request_counter.add(1, attributes)
         request_duration.record(duration_ms, attributes)
         return response
 
     @app.get("/health")
     def health():
-        return jsonify({"status": "ok", "service": SERVICE_NAME})
+        return jsonify(
+            {
+                "status": "ok",
+                "service": SERVICE_NAME,
+                "team": TEAM,
+                "role": SERVICE_ROLE,
+                "dependencies": DEPENDENCIES,
+            }
+        )
 
-    if mode == "account":
-        @app.get("/accounts/<account_id>/balance")
-        def balance(account_id):
-            with tracer.start_as_current_span("account.lookup_balance") as span:
-                span.set_attribute("bank.account_id", account_id)
-                simulated_latency("balance_lookup")
-                account = accounts.get(account_id)
-                if not account:
-                    span.set_attribute("bank.result", "not_found")
-                    log_event("WARN", "account not found", operation="balance", account_id=account_id)
-                    return jsonify({"error": "account not found"}), 404
-                log_event("INFO", "balance checked", operation="balance", account_id=account_id)
-                return jsonify({"account_id": account_id, **account})
+    @app.get("/info")
+    def info():
+        return jsonify({"service": SERVICE_NAME, "team": TEAM, "role": SERVICE_ROLE, "dependencies": DEPENDENCIES})
 
-        @app.post("/accounts/<account_id>/debit")
-        def debit(account_id):
-            body = request.get_json(silent=True) or {}
-            amount = float(body.get("amount", 0))
-            with tracer.start_as_current_span("account.debit") as span:
-                span.set_attribute("bank.account_id", account_id)
-                span.set_attribute("bank.amount", amount)
-                simulated_latency("debit")
-                with account_lock:
-                    account = accounts.get(account_id)
-                    if not account or amount <= 0 or account["balance"] < amount:
-                        transaction_counter.add(1, {"operation": "debit", "result": "rejected"})
-                        log_event("WARN", "debit rejected", operation="debit", account_id=account_id, amount=amount, reason="insufficient_funds_or_invalid_account")
-                        return jsonify({"error": "debit rejected"}), 409
-                    account["balance"] -= amount
-                transaction_counter.add(1, {"operation": "debit", "result": "approved"})
-                log_event("INFO", "debit approved", operation="debit", account_id=account_id, amount=amount)
-                return jsonify({"status": "approved", "account_id": account_id, "amount": amount})
+    @app.post("/process")
+    def process():
+        body = request.get_json(silent=True) or {}
+        operation = body.get("operation", "banking.transaction")
+        with tracer.start_as_current_span(f"{SERVICE_NAME}.process") as span:
+            span.set_attributes(
+                {
+                    "bank.service": SERVICE_NAME,
+                    "bank.team": TEAM,
+                    "bank.service_role": SERVICE_ROLE,
+                    "bank.operation": operation,
+                    "bank.dependency_count": len(DEPENDENCIES),
+                }
+            )
+            simulated_latency(operation)
+            if random.random() < 0.025:
+                transaction_counter.add(1, {"service": SERVICE_NAME, "team": TEAM, "result": "error"})
+                log_event("ERROR", "simulated service failure", operation=operation, reason="fault_injection")
+                return jsonify({"status": "failed", "service": SERVICE_NAME, "reason": "fault_injection"}), 503
 
-    if mode == "payment":
-        @app.post("/transfers")
-        def transfer():
-            body = request.get_json(silent=True) or {}
-            source = body.get("from", "alice")
-            destination = body.get("to", "bob")
-            amount = float(body.get("amount", 100))
-            with tracer.start_as_current_span("payment.transfer") as span:
-                span.set_attributes({"bank.source_account": source, "bank.destination_account": destination, "bank.amount": amount})
-                simulated_latency("payment_risk_check")
-                # This controlled error rate creates data for anomaly detection.
-                if random.random() < 0.04:
-                    transaction_counter.add(1, {"operation": "transfer", "result": "risk_rejected"})
-                    log_event("WARN", "transfer rejected by risk simulation", operation="transfer", amount=amount, reason="risk_rule")
-                    return jsonify({"status": "rejected", "reason": "risk_rule"}), 403
-                account_url = os.getenv("ACCOUNT_SERVICE_URL", "http://localhost:8081")
-                response = requests.post(
-                    f"{account_url}/accounts/{source}/debit", json={"amount": amount}, timeout=5
-                )
-                if response.status_code != 200:
-                    transaction_counter.add(1, {"operation": "transfer", "result": "failed"})
-                    log_event("ERROR", "transfer failed during debit", operation="transfer", amount=amount, upstream_status=response.status_code)
-                    return jsonify({"status": "failed", "reason": "debit_failed"}), 502
-                # Credit is local to this simulation; the inter-service debit call provides a distributed trace.
-                with account_lock:
-                    if destination in accounts:
-                        accounts[destination]["balance"] += amount
-                transaction_counter.add(1, {"operation": "transfer", "result": "approved"})
-                log_event("INFO", "transfer approved", operation="transfer", source=source, destination=destination, amount=amount)
-                return jsonify({"status": "approved", "from": source, "to": destination, "amount": amount})
+            downstream_payload = {
+                "operation": operation,
+                "correlation_id": body.get("correlation_id", f"txn-{random.randint(100000, 999999)}"),
+                "amount": body.get("amount", random.choice([25, 50, 100, 250, 500, 2500])),
+                "origin": body.get("origin", SERVICE_NAME),
+                "visited": [*body.get("visited", []), SERVICE_NAME],
+            }
+            responses, failures = process_dependencies(downstream_payload)
+            result = "degraded" if failures else "approved"
+            transaction_counter.add(1, {"service": SERVICE_NAME, "team": TEAM, "result": result})
+            log_event(
+                "WARN" if failures else "INFO",
+                "service operation completed",
+                operation=operation,
+                downstream_count=len(responses),
+                downstream_failures=failures,
+                result=result,
+            )
+            return jsonify(
+                {
+                    "status": result,
+                    "service": SERVICE_NAME,
+                    "team": TEAM,
+                    "downstream": responses,
+                    "downstream_failures": failures,
+                }
+            ), (207 if failures else 200)
 
     return app
 
 
 def run_traffic():
-    logging.basicConfig(level=logging.INFO)
-    payment_url = os.getenv("PAYMENT_SERVICE_URL", "http://localhost:8082")
-    accounts_to_use = ["alice", "bob", "carol"]
+    if not TARGETS:
+        log_event("ERROR", "no traffic targets configured")
+        while True:
+            time.sleep(60)
+
     session = requests.Session()
+    index = 0
     while True:
+        target = TARGETS[index % len(TARGETS)]
+        index += 1
         started = time.perf_counter()
-        source, destination = random.sample(accounts_to_use, 2)
-        amount = random.choice([25, 50, 100, 250, 500, 2500])
+        payload = {
+            "operation": random.choice(
+                ["card.purchase", "cash.withdrawal", "account.inquiry", "fund.transfer", "bill.payment"]
+            ),
+            "amount": random.choice([25, 50, 100, 250, 500, 2500]),
+            "origin": "traffic-generator",
+            "correlation_id": f"txn-{random.randint(100000, 999999)}",
+        }
         try:
             with tracer.start_as_current_span("traffic.scenario") as span:
-                span.set_attribute("scenario.source", source)
-                span.set_attribute("scenario.destination", destination)
-                response = session.post(
-                    f"{payment_url}/transfers",
-                    json={"from": source, "to": destination, "amount": amount},
-                    timeout=8,
+                span.set_attributes({"bank.target": target, "bank.operation": payload["operation"]})
+                response = session.post(f"http://{target}:8080/process", json=payload, timeout=12)
+                log_event(
+                    "INFO" if response.ok else "WARN",
+                    "traffic scenario completed",
+                    target=target,
+                    operation=payload["operation"],
+                    status_code=response.status_code,
+                    duration_ms=round((time.perf_counter() - started) * 1000),
                 )
-                log_event("INFO" if response.ok else "WARN", "traffic scenario completed", operation="transfer", source=source, destination=destination, amount=amount, status_code=response.status_code, duration_ms=round((time.perf_counter() - started) * 1000))
         except requests.RequestException as exc:
-            log_event("ERROR", "traffic scenario failed", operation="transfer", error=str(exc))
-        time.sleep(1.5)
+            log_event("ERROR", "traffic scenario failed", target=target, error=str(exc))
+        time.sleep(1.0)
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "account"
+    mode = sys.argv[1] if len(sys.argv) > 1 else "service"
     if mode == "traffic":
         run_traffic()
     else:
-        port = int(os.getenv("SERVICE_PORT", "8080"))
-        create_app(mode).run(host="0.0.0.0", port=port)
+        create_app().run(host="0.0.0.0", port=SERVICE_PORT)

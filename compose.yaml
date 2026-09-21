@@ -1,3 +1,25 @@
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+    compress: "true"
+
+x-banking-app: &banking-app
+  build: ./banking-app
+  logging: *default-logging
+  environment: &banking-env
+    SERVICE_PORT: "8080"
+    LOGSTASH_HOST: logstash
+    LOGSTASH_PORT: "5044"
+    OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+    OTEL_RESOURCE_ATTRIBUTES: deployment.environment=observability-lab,service.version=1.0.0
+  depends_on:
+    otel-collector:
+      condition: service_started
+    logstash:
+      condition: service_started
+
 services:
   elasticsearch:
     image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
@@ -10,11 +32,24 @@ services:
       - "9200:9200"
     volumes:
       - elasticsearch-data:/usr/share/elasticsearch/data
+    logging: *default-logging
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:9200/_cluster/health?wait_for_status=yellow || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 20
+
+  elasticsearch-ilm-init:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    entrypoint: ["/bin/sh", "/scripts/setup-ilm.sh"]
+    environment:
+      LOG_RETENTION_DAYS: "7"
+    volumes:
+      - ./elasticsearch/setup-ilm.sh:/scripts/setup-ilm.sh:ro
+    logging: *default-logging
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
 
   kibana:
     image: docker.elastic.co/kibana/kibana:8.15.0
@@ -22,6 +57,7 @@ services:
       ELASTICSEARCH_HOSTS: http://elasticsearch:9200
     ports:
       - "5601:5601"
+    logging: *default-logging
     depends_on:
       elasticsearch:
         condition: service_healthy
@@ -33,27 +69,29 @@ services:
       XPACK_MONITORING_ENABLED: "false"
     ports:
       - "5044:5044"
+    logging: *default-logging
     volumes:
       - ./logstash/pipeline:/usr/share/logstash/pipeline:ro
     depends_on:
-      elasticsearch:
-        condition: service_healthy
+      elasticsearch-ilm-init:
+        condition: service_completed_successfully
 
   jaeger:
     image: jaegertracing/all-in-one:1.57
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
+    logging: *default-logging
     ports:
       - "16686:16686"
       - "14317:4317"
       - "14318:4318"
-
 
   otel-collector:
     image: otel/opentelemetry-collector-contrib:0.108.0
     command: ["--config=/etc/otelcol-contrib/config.yaml"]
     volumes:
       - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    logging: *default-logging
     ports:
       - "4319:4317"
       - "4320:4318"
@@ -62,59 +100,324 @@ services:
       jaeger:
         condition: service_started
 
-  account-service:
-    build: ./banking-app
+  api-gateway:
+    <<: *banking-app
     environment:
-      SERVICE_NAME: account-service
-      SERVICE_PORT: "8081"
-      LOGSTASH_HOST: logstash
-      LOGSTASH_PORT: "5044"
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-      OTEL_SERVICE_NAME: account-service
-      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=observability-lab,service.version=1.0.0
-    command: ["python", "app.py", "account"]
+      <<: *banking-env
+      SERVICE_NAME: api-gateway
+      TEAM: channel-edge
+      SERVICE_ROLE: gateway
+      SERVICE_DEPENDENCIES: ipg,mobile-banking,internet-banking,branch-channel,atm-channel
+      OTEL_SERVICE_NAME: api-gateway
     ports:
-      - "18081:8081"
-    depends_on:
-      otel-collector:
-        condition: service_started
-      logstash:
-        condition: service_started
+      - "18080:8080"
+
+  ipg:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: ipg
+      TEAM: channel-edge
+      SERVICE_ROLE: entry-point
+      SERVICE_DEPENDENCIES: switch,fraud-service
+      OTEL_SERVICE_NAME: ipg
+    ports:
+      - "18083:8080"
+
+  switch:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: switch
+      TEAM: integration
+      SERVICE_ROLE: entry-point
+      SERVICE_DEPENDENCIES: esb,fraud-service
+    ports:
+      - "18084:8080"
+
+  esb:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: esb
+      TEAM: integration
+      SERVICE_ROLE: entry-point
+      SERVICE_DEPENDENCIES: core-banking,customer-service
+    ports:
+      - "18085:8080"
+
+  core-banking:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: core-banking
+      TEAM: core-banking
+      SERVICE_ROLE: orchestrator
+      SERVICE_DEPENDENCIES: ledger-service,transaction-service
+    ports:
+      - "18086:8080"
+
+  mobile-banking:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: mobile-banking
+      TEAM: channel-edge
+      SERVICE_ROLE: channel
+      SERVICE_DEPENDENCIES: identity-service,payment-service
+      OTEL_SERVICE_NAME: mobile-banking
+
+  internet-banking:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: internet-banking
+      TEAM: channel-edge
+      SERVICE_ROLE: channel
+      SERVICE_DEPENDENCIES: identity-service,account-service
+      OTEL_SERVICE_NAME: internet-banking
+
+  branch-channel:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: branch-channel
+      TEAM: channel-edge
+      SERVICE_ROLE: channel
+      SERVICE_DEPENDENCIES: identity-service,account-service
+      OTEL_SERVICE_NAME: branch-channel
+
+  atm-channel:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: atm-channel
+      TEAM: channel-edge
+      SERVICE_ROLE: channel
+      SERVICE_DEPENDENCIES: identity-service,atm-service
+      OTEL_SERVICE_NAME: atm-channel
+
+  customer-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: customer-service
+      TEAM: core-banking
+      SERVICE_ROLE: domain-service
+      SERVICE_DEPENDENCIES: account-service,identity-service
+      OTEL_SERVICE_NAME: customer-service
+
+  account-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: account-service
+      TEAM: core-banking
+      SERVICE_ROLE: domain-service
+      SERVICE_DEPENDENCIES: ""
+      OTEL_SERVICE_NAME: account-service
+
+  ledger-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: ledger-service
+      TEAM: core-banking
+      SERVICE_ROLE: domain-service
+      SERVICE_DEPENDENCIES: transaction-service,audit-service
+      OTEL_SERVICE_NAME: ledger-service
+
+  balance-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: balance-service
+      TEAM: core-banking
+      SERVICE_ROLE: domain-service
+      SERVICE_DEPENDENCIES: account-service,ledger-service
+      OTEL_SERVICE_NAME: balance-service
+
+  transaction-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: transaction-service
+      TEAM: core-banking
+      SERVICE_ROLE: domain-service
+      SERVICE_DEPENDENCIES: account-service,ledger-service
+      OTEL_SERVICE_NAME: transaction-service
 
   payment-service:
-    build: ./banking-app
+    <<: *banking-app
     environment:
+      <<: *banking-env
       SERVICE_NAME: payment-service
-      SERVICE_PORT: "8082"
-      ACCOUNT_SERVICE_URL: http://account-service:8081
-      LOGSTASH_HOST: logstash
-      LOGSTASH_PORT: "5044"
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      TEAM: payments-cards
+      SERVICE_ROLE: orchestrator
+      SERVICE_DEPENDENCIES: risk-engine,transfer-service
       OTEL_SERVICE_NAME: payment-service
-      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=observability-lab,service.version=1.0.0
-    command: ["python", "app.py", "payment"]
-    ports:
-      - "18082:8082"
-    depends_on:
-      account-service:
-        condition: service_started
-      otel-collector:
-        condition: service_started
-      logstash:
-        condition: service_started
+
+  transfer-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: transfer-service
+      TEAM: payments-cards
+      SERVICE_ROLE: domain-service
+      SERVICE_DEPENDENCIES: balance-service,ledger-service,notification-service
+      OTEL_SERVICE_NAME: transfer-service
+
+  card-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: card-service
+      TEAM: payments-cards
+      SERVICE_ROLE: domain-service
+      SERVICE_DEPENDENCIES: risk-engine,account-service,notification-service
+      OTEL_SERVICE_NAME: card-service
+
+  atm-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: atm-service
+      TEAM: payments-cards
+      SERVICE_ROLE: domain-service
+      SERVICE_DEPENDENCIES: card-service,balance-service
+      OTEL_SERVICE_NAME: atm-service
+
+  bill-payment-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: bill-payment-service
+      TEAM: payments-cards
+      SERVICE_ROLE: domain-service
+      SERVICE_DEPENDENCIES: payment-service,customer-service
+      OTEL_SERVICE_NAME: bill-payment-service
+
+  fraud-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: fraud-service
+      TEAM: risk-compliance
+      SERVICE_ROLE: decision-service
+      SERVICE_DEPENDENCIES: risk-engine,aml-service
+      OTEL_SERVICE_NAME: fraud-service
+
+  aml-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: aml-service
+      TEAM: risk-compliance
+      SERVICE_ROLE: decision-service
+      SERVICE_DEPENDENCIES: audit-service,customer-service
+      OTEL_SERVICE_NAME: aml-service
+
+  risk-engine:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: risk-engine
+      TEAM: risk-compliance
+      SERVICE_ROLE: decision-service
+      SERVICE_DEPENDENCIES: customer-service
+      OTEL_SERVICE_NAME: risk-engine
+
+  notification-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: notification-service
+      TEAM: operations-data
+      SERVICE_ROLE: integration-service
+      SERVICE_DEPENDENCIES: customer-service,audit-service
+      OTEL_SERVICE_NAME: notification-service
+
+  reconciliation-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: reconciliation-service
+      TEAM: operations-data
+      SERVICE_ROLE: batch-service
+      SERVICE_DEPENDENCIES: ledger-service,settlement-service
+      OTEL_SERVICE_NAME: reconciliation-service
+
+  settlement-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: settlement-service
+      TEAM: operations-data
+      SERVICE_ROLE: batch-service
+      SERVICE_DEPENDENCIES: ledger-service,transaction-service
+      OTEL_SERVICE_NAME: settlement-service
+
+  reporting-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: reporting-service
+      TEAM: operations-data
+      SERVICE_ROLE: reporting-service
+      SERVICE_DEPENDENCIES: reconciliation-service,audit-service
+      OTEL_SERVICE_NAME: reporting-service
+
+  statement-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: statement-service
+      TEAM: operations-data
+      SERVICE_ROLE: reporting-service
+      SERVICE_DEPENDENCIES: reporting-service,account-service
+      OTEL_SERVICE_NAME: statement-service
+
+  identity-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: identity-service
+      TEAM: operations-data
+      SERVICE_ROLE: platform-service
+      SERVICE_DEPENDENCIES: audit-service
+      OTEL_SERVICE_NAME: identity-service
+
+  audit-service:
+    <<: *banking-app
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: audit-service
+      TEAM: operations-data
+      SERVICE_ROLE: platform-service
+      SERVICE_DEPENDENCIES: ""
+      OTEL_SERVICE_NAME: audit-service
 
   traffic-generator:
-    build: ./banking-app
-    environment:
-      ACCOUNT_SERVICE_URL: http://account-service:8081
-      PAYMENT_SERVICE_URL: http://payment-service:8082
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
-      OTEL_SERVICE_NAME: traffic-generator
-      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=observability-lab,service.version=1.0.0
-      LOGSTASH_HOST: logstash
-      LOGSTASH_PORT: "5044"
+    <<: *banking-app
     command: ["python", "app.py", "traffic"]
+    environment:
+      <<: *banking-env
+      SERVICE_NAME: traffic-generator
+      TEAM: workload
+      SERVICE_ROLE: workload-generator
+      TARGETS: api-gateway,ipg,switch,esb,core-banking,mobile-banking,internet-banking,branch-channel,atm-channel,customer-service,account-service,ledger-service,balance-service,transaction-service,payment-service,transfer-service,card-service,atm-service,bill-payment-service,fraud-service,aml-service,risk-engine,notification-service,reconciliation-service,settlement-service,reporting-service,statement-service,identity-service,audit-service
+      OTEL_SERVICE_NAME: traffic-generator
     depends_on:
+      api-gateway:
+        condition: service_started
+      ipg:
+        condition: service_started
+      switch:
+        condition: service_started
+      esb:
+        condition: service_started
+      core-banking:
+        condition: service_started
       account-service:
         condition: service_started
       payment-service:

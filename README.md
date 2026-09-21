@@ -1,29 +1,15 @@
 # Banking Microservices Observability Lab
 
-A Docker Compose environment that simulates a banking microservice application and produces logs, metrics, and distributed traces for later anomaly detection, bottleneck analysis, and observability experiments.
+A Docker Compose observability lab that simulates a large banking platform with **30 application services**. The application generates structured logs, OpenTelemetry metrics, and distributed traces for anomaly detection, bottleneck analysis, dependency mapping, and team-level observability experiments.
 
-## Architecture
+The 30 application services are:
 
-```text
-traffic-generator
-        |
-        v
-payment-service -------------> account-service
-        |                              |
-        | OTLP traces and metrics     | OTLP traces and metrics
-        v                              v
-              otel-collector
-                 |
-       +---------+----------+
-       |                    |
-       v                    v
-    Jaeger             Prometheus endpoint
-   traces                 metrics
+- 29 banking microservices
+- 1 continuous `traffic-generator` workload service
 
-banking services -- JSON/TCP --> Logstash --> Elasticsearch --> Kibana
-```
+The observability infrastructure is additional and includes Elasticsearch, Logstash, Kibana, Jaeger, and the OpenTelemetry Collector.
 
-## Start the environment
+## Start the platform
 
 From the project root:
 
@@ -31,224 +17,258 @@ From the project root:
 docker compose up -d --build
 ```
 
-Check the running services:
+Check all containers:
 
 ```bash
 docker compose ps
 ```
 
-Follow application traffic:
+The first build creates one reusable instrumented Python image and runs it with different service metadata and dependency configuration.
+
+Follow all banking traffic:
 
 ```bash
-docker compose logs -f traffic-generator payment-service account-service
+docker compose logs -f traffic-generator api-gateway ipg switch esb core-banking
 ```
 
-Stop the environment:
+Stop the platform:
 
 ```bash
 docker compose down
 ```
 
-Stop the environment and remove Elasticsearch data:
+Stop the platform and delete Elasticsearch data:
 
 ```bash
 docker compose down -v
 ```
 
+## Team and service inventory
+
+### Channel & Edge team
+
+| Service | Role | Downstream services |
+|---|---|---|
+| `api-gateway` | Gateway | `ipg`, `mobile-banking`, `internet-banking`, `branch-channel`, `atm-channel` |
+| `ipg` | Internet payment gateway / entry point | `switch`, `fraud-service` |
+| `mobile-banking` | Digital channel | `identity-service`, `payment-service` |
+| `internet-banking` | Digital channel | `identity-service`, `account-service` |
+| `branch-channel` | Branch channel | `identity-service`, `account-service` |
+| `atm-channel` | ATM channel | `identity-service`, `atm-service` |
+
+### Integration team
+
+| Service | Role | Downstream services |
+|---|---|---|
+| `switch` | Payment switch / entry point | `esb`, `fraud-service` |
+| `esb` | Enterprise service bus / entry point | `core-banking`, `customer-service` |
+
+### Core Banking team
+
+| Service | Role | Downstream services |
+|---|---|---|
+| `core-banking` | Core banking orchestrator / entry point | `ledger-service`, `transaction-service` |
+| `customer-service` | Customer domain service | `account-service`, `identity-service` |
+| `account-service` | Account domain service | None |
+| `ledger-service` | Ledger domain service | `transaction-service`, `audit-service` |
+| `balance-service` | Balance domain service | `account-service`, `ledger-service` |
+| `transaction-service` | Transaction domain service | `account-service`, `ledger-service` |
+
+### Payments & Cards team
+
+| Service | Role | Downstream services |
+|---|---|---|
+| `payment-service` | Payment orchestrator | `risk-engine`, `transfer-service` |
+| `transfer-service` | Transfer domain service | `balance-service`, `ledger-service`, `notification-service` |
+| `card-service` | Card domain service | `risk-engine`, `account-service`, `notification-service` |
+| `atm-service` | ATM transaction service | `card-service`, `balance-service` |
+| `bill-payment-service` | Bill payment domain service | `payment-service`, `customer-service` |
+
+### Risk & Compliance team
+
+| Service | Role | Downstream services |
+|---|---|---|
+| `fraud-service` | Fraud decision service | `risk-engine`, `aml-service` |
+| `aml-service` | Anti-money-laundering decision service | `audit-service`, `customer-service` |
+| `risk-engine` | Risk decision service | `customer-service` |
+
+### Operations & Data team
+
+| Service | Role | Downstream services |
+|---|---|---|
+| `notification-service` | Notification integration service | `customer-service`, `audit-service` |
+| `reconciliation-service` | Reconciliation batch service | `ledger-service`, `settlement-service` |
+| `settlement-service` | Settlement batch service | `ledger-service`, `transaction-service` |
+| `reporting-service` | Reporting service | `reconciliation-service`, `audit-service` |
+| `statement-service` | Statement service | `reporting-service`, `account-service` |
+| `identity-service` | Identity/platform service | `audit-service` |
+| `audit-service` | Audit/platform service | None |
+
+### Workload team
+
+| Service | Role | Behavior |
+|---|---|---|
+| `traffic-generator` | Workload generator | Calls all 29 banking services in rotation |
+
 ## Service endpoints
 
-The host ports below are used by the current Compose configuration. Some ports are remapped from their standard values because they were already in use on the host machine.
+All internal application services listen on port `8080` inside the Compose network. The main entry points are exposed on the host for manual testing:
 
-| Service | Endpoint | Purpose |
+| Service | Host endpoint | Purpose |
 |---|---|---|
-| Kibana | http://localhost:5601 | Explore and visualize indexed banking logs |
-| Elasticsearch | http://localhost:9200 | Search and store logs |
-| Jaeger UI | http://localhost:16686 | Explore distributed traces |
-| Account service | http://localhost:18081 | Banking account API |
-| Payment service | http://localhost:18082 | Banking transfer API |
-| OpenTelemetry Collector metrics | http://localhost:8889/metrics | Prometheus-format application metrics |
-| Logstash TCP input | `localhost:5044` | JSON-lines log ingestion |
-| Jaeger OTLP gRPC | `localhost:14317` | Host OTLP gRPC ingestion endpoint |
-| Jaeger OTLP HTTP | `localhost:14318` | Host OTLP HTTP ingestion endpoint |
+| API gateway | http://localhost:18080 | Main banking entry point |
+| IPG | http://localhost:18083 | Internet payment gateway |
+| Switch | http://localhost:18084 | Payment switching entry point |
+| ESB | http://localhost:18085 | Enterprise integration bus |
+| Core banking | http://localhost:18086 | Core banking orchestration |
 
-The application containers use internal Docker network addresses. For example:
-
-- Collector OTLP gRPC: `http://otel-collector:4317`
-- Account service: `http://account-service:8081`
-- Payment service: `http://payment-service:8082`
-- Logstash: `logstash:5044`
-
-## Account service API
-
-The account service is available externally at `http://localhost:18081`.
-
-### Health check
-
-```bash
-curl http://localhost:18081/health
-```
-
-Example response:
-
-```json
-{"service":"account-service","status":"ok"}
-```
-
-### Get account balance
-
-```bash
-curl http://localhost:18081/accounts/alice/balance
-```
-
-Supported sample accounts:
-
-- `alice`
-- `bob`
-- `carol`
-
-Example response:
-
-```json
-{
-  "account_id": "alice",
-  "balance": 12000.0,
-  "currency": "USD"
-}
-```
-
-### Debit an account
-
-```bash
-curl -X POST http://localhost:18081/accounts/alice/debit \
-  -H 'Content-Type: application/json' \
-  -d '{"amount":100}'
-```
-
-Successful response:
-
-```json
-{
-  "status": "approved",
-  "account_id": "alice",
-  "amount": 100.0
-}
-```
-
-A debit can be rejected with HTTP `409` when the account does not exist, the amount is invalid, or the balance is insufficient.
-
-## Payment service API
-
-The payment service is available externally at `http://localhost:18082`.
-
-### Health check
-
-```bash
-curl http://localhost:18082/health
-```
-
-### Transfer money
-
-```bash
-curl -X POST http://localhost:18082/transfers \
-  -H 'Content-Type: application/json' \
-  -d '{"from":"alice","to":"bob","amount":100}'
-```
-
-Example successful response:
-
-```json
-{
-  "status": "approved",
-  "from": "alice",
-  "to": "bob",
-  "amount": 100.0
-}
-```
-
-A transfer may return:
-
-- `200` — transfer approved
-- `403` — rejected by the simulated risk rule
-- `502` — debit failed in the account service
-
-The payment service calls the account service to debit the source account. This creates a distributed trace spanning the traffic generator, payment service, and account service.
-
-## Telemetry services
-
-### OpenTelemetry Collector
-
-Configuration: `otel-collector/config.yaml`
-
-The Collector accepts OTLP data through:
-
-- Internal gRPC receiver: `otel-collector:4317`
-- Internal HTTP receiver: `otel-collector:4318`
-- Host gRPC port: `localhost:4319`
-- Host HTTP port: `localhost:4320`
-
-The configured pipelines are:
-
-- Traces: OTLP receiver -> memory limiter -> resource enrichment -> batch -> Jaeger and debug exporter
-- Metrics: OTLP receiver -> memory limiter -> resource enrichment -> batch -> Prometheus exporter and debug exporter
-
-The Collector exposes application metrics on:
+Each application service exposes:
 
 ```text
-http://localhost:8889/metrics
+GET  /health
+GET  /info
+POST /process
 ```
 
-Useful metric names include:
+Example health check:
 
-- `banking_requests_total`
-- `banking_request_duration_ms_milliseconds`
-- `banking_transactions_total`
+```bash
+curl http://localhost:18080/health
+```
 
-### Jaeger
+Example transaction submitted to the API gateway:
 
-Open the Jaeger UI at:
+```bash
+curl -X POST http://localhost:18080/process \
+  -H 'Content-Type: application/json' \
+  -d '{"operation":"fund.transfer","amount":250,"correlation_id":"manual-001"}'
+```
+
+Example direct IPG request:
+
+```bash
+curl -X POST http://localhost:18083/process \
+  -H 'Content-Type: application/json' \
+  -d '{"operation":"card.purchase","amount":100,"correlation_id":"ipg-001"}'
+```
+
+The response includes the selected downstream calls and any degraded dependencies.
+
+## Observability endpoints
+
+| Component | Endpoint | Purpose |
+|---|---|---|
+| Jaeger UI | http://localhost:16686 | Search distributed traces and dependency graph |
+| Jaeger OTLP gRPC | `localhost:14317` | Host OTLP gRPC endpoint |
+| Jaeger OTLP HTTP | `localhost:14318` | Host OTLP HTTP endpoint |
+| Kibana | http://localhost:5601 | Explore and visualize logs |
+| Elasticsearch | http://localhost:9200 | Log search and storage |
+| Collector metrics | http://localhost:8889/metrics | Prometheus-format metrics |
+| Logstash TCP | `localhost:5044` | JSON-lines log ingestion |
+
+Internal application exporters use:
+
+- OTLP Collector: `otel-collector:4317`
+- Logstash: `logstash:5044`
+
+## How the topology generates traces
+
+The traffic generator calls every banking service in rotation. Each service:
+
+1. Creates an instrumented server span for `/process`.
+2. Adds `bank.team`, `bank.service_role`, operation, and dependency attributes.
+3. Selects one or two configured downstream services.
+4. Calls each downstream service over HTTP.
+5. Propagates the active trace context through the OpenTelemetry Requests instrumentation.
+6. Emits structured logs containing `trace_id`, team, service, operation, and dependency status.
+
+A typical trace can look like:
+
+```text
+traffic-generator
+  -> api-gateway
+      -> ipg
+          -> switch
+              -> esb
+                  -> core-banking
+                      -> ledger-service
+                          -> audit-service
+```
+
+The exact path varies because services randomly select one or two configured dependencies per request.
+
+## View all services in Jaeger
+
+Open:
 
 ```text
 http://localhost:16686
 ```
 
-The expected services in Jaeger are:
+In Jaeger:
 
-- `traffic-generator`
-- `payment-service`
-- `account-service`
+1. Wait at least 15–30 seconds after startup for traces to be exported.
+2. Open **System Architecture** or `/dependencies` to see the service graph.
+3. In **Search**, select `traffic-generator`, `api-gateway`, or another service.
+4. Set the lookback window to `Last Hour`.
+5. Click **Find Traces**.
+6. Open a trace to inspect cross-team calls and latency.
 
-Useful trace operations include:
+The service dropdown should eventually contain all 30 application services. The reliable check is the Jaeger API:
 
-- `traffic.scenario`
-- `payment.transfer`
-- `account.debit`
-- `account.lookup_balance`
-
-### Logstash and Elasticsearch
-
-Application logs are emitted as JSON lines over TCP to Logstash on port `5044`.
-
-Pipeline configuration: `logstash/pipeline/logstash.conf`
-
-Logs are written to daily indices using this pattern:
-
-```text
-banking-logs-YYYY.MM.dd
+```bash
+curl -s http://localhost:16686/api/services | jq
 ```
 
-For example:
+To count services reported by Jaeger:
 
-```text
-banking-logs-2026.09.20
+```bash
+curl -s http://localhost:16686/api/services | jq '.data | length'
 ```
 
-Check available banking log indices:
+The count increases as each service emits its first trace. Because the traffic generator rotates through all targets, all 30 application services should appear after the workload has run for a short period.
+
+Query recent traces for a specific service:
+
+```bash
+curl -s 'http://localhost:16686/api/traces?service=api-gateway&lookback=1h&limit=10' | jq
+```
+
+Continuously watch the reported service count:
+
+```bash
+watch -n 5 'curl -s http://localhost:16686/api/services | jq ".data | length"'
+```
+
+## Logs in Kibana and Elasticsearch
+
+Open Kibana:
+
+```text
+http://localhost:5601
+```
+
+Create a data view using:
+
+```text
+banking-logs-*
+```
+
+Use `@timestamp` as the time field and set the refresh interval to 5 seconds.
+
+Watch logs in the terminal:
+
+```bash
+docker compose logs -f traffic-generator api-gateway payment-service core-banking
+```
+
+Check indexed log documents:
 
 ```bash
 curl 'http://localhost:9200/_cat/indices/banking-logs-*?format=json'
 ```
 
-Search the most recent logs:
+Search recent errors and slow requests:
 
 ```bash
 curl -X POST 'http://localhost:9200/banking-logs-*/_search?pretty' \
@@ -256,63 +276,12 @@ curl -X POST 'http://localhost:9200/banking-logs-*/_search?pretty' \
   -d '{
     "size": 20,
     "sort": [{"@timestamp": "desc"}],
-    "query": {"match_all": {}}
-  }'
-```
-
-In Kibana, create a data view with:
-
-```text
-banking-logs-*
-```
-
-Use `@timestamp` as the time field.
-
-## Generated data for analysis
-
-The traffic generator continuously sends transfers approximately every 1.5 seconds. The application intentionally creates both normal and abnormal behavior:
-
-- Normal approved transfers
-- Risk-rule rejections
-- Insufficient-funds or invalid-account failures
-- HTTP `502` responses when the debit operation fails
-- Slow requests caused by simulated tail latency
-- Inter-service calls that can be analyzed for bottlenecks
-
-The simulated slow path is enabled for approximately 8% of operations and sleeps for roughly 0.8 to 2.5 seconds. This produces useful latency outliers in traces, logs, and request-duration histograms.
-
-## Structured log fields
-
-Application log records include fields such as:
-
-- `timestamp`
-- `level`
-- `service`
-- `message`
-- `trace_id`
-- `operation`
-- `account_id`
-- `source`
-- `destination`
-- `amount`
-- `status_code`
-- `duration_ms`
-- `reason`
-
-These fields can be used in Kibana queries and anomaly detection experiments.
-
-Example Elasticsearch query for errors:
-
-```bash
-curl -X POST 'http://localhost:9200/banking-logs-*/_search?pretty' \
-  -H 'Content-Type: application/json' \
-  -d '{
     "query": {
       "bool": {
         "should": [
           {"term": {"level.keyword": "ERROR"}},
           {"term": {"level.keyword": "WARN"}},
-          {"range": {"duration_ms": {"gte": 1000}}}
+          {"range": {"delay_ms": {"gte": 1000}}}
         ],
         "minimum_should_match": 1
       }
@@ -320,48 +289,121 @@ curl -X POST 'http://localhost:9200/banking-logs-*/_search?pretty' \
   }'
 ```
 
-## Useful operational commands
-
-View all logs:
-
-```bash
-docker compose logs -f
-```
-
-View only OpenTelemetry Collector logs:
-
-```bash
-docker compose logs -f otel-collector
-```
-
-Restart the application services:
-
-```bash
-docker compose restart account-service payment-service traffic-generator
-```
-
-Rebuild the application image after code changes:
-
-```bash
-docker compose up -d --build account-service payment-service traffic-generator
-```
-
-Inspect the rendered Compose configuration:
-
-```bash
-docker compose config
-```
-
-## Data persistence
-
-Elasticsearch data is stored in the Docker volume:
+Useful Kibana filters:
 
 ```text
-lmt_elasticsearch-data
+team: "channel-edge"
 ```
 
-Removing the volume with `docker compose down -v` deletes the indexed logs.
+```text
+service: "ipg" AND level: "ERROR"
+```
+
+```text
+service_role: "entry-point"
+```
+
+```text
+message: "simulated tail latency"
+```
+
+## Metrics
+
+The Collector exposes Prometheus-format metrics:
+
+```text
+http://localhost:8889/metrics
+```
+
+Useful metrics include:
+
+- `banking_requests_total`
+- `banking_request_duration_ms_milliseconds`
+- `banking_transactions_total`
+- `banking_dependency_calls_total`
+
+Watch service activity:
+
+```bash
+watch -n 5 'curl -s http://localhost:8889/metrics | grep banking_requests_total'
+```
+
+Watch cross-service calls:
+
+```bash
+watch -n 5 'curl -s http://localhost:8889/metrics | grep banking_dependency_calls_total'
+```
+
+## Simulated anomaly and bottleneck signals
+
+The simulator intentionally produces useful analysis data:
+
+- Approximately 8% tail-latency requests with 0.8–2.5 second delays
+- Approximately 2.5% controlled service failures with HTTP `503`
+- Degraded responses when downstream dependencies fail
+- Variable fan-out at gateways and orchestrators
+- Cross-team dependency calls
+- Correlation IDs and trace IDs in logs
+- Entry-point, integration, core-banking, payment, risk, and operations paths
+
+These signals support experiments such as:
+
+- Finding the slowest team or service
+- Comparing entry-point latency with core-service latency
+- Detecting elevated failure rates by team
+- Identifying high-fanout services
+- Finding dependency edges with repeated failures
+- Correlating Kibana log errors with Jaeger trace IDs
+
+## Configuration model
+
+The service topology is defined in `compose.yaml`. Each application service has:
+
+- `SERVICE_NAME`
+- `TEAM`
+- `SERVICE_ROLE`
+- `SERVICE_DEPENDENCIES`
+- `OTEL_SERVICE_NAME`
+- `OTEL_RESOURCE_ATTRIBUTES`
+
+The reusable simulator is in `banking-app/app.py`.
+
+The OpenTelemetry Collector configuration is in `otel-collector/config.yaml`.
+
+The Logstash pipeline is in `logstash/pipeline/logstash.conf`.
+
+## Troubleshooting
+
+If Jaeger shows fewer than 30 services:
+
+```bash
+docker compose ps
+```
+
+Confirm that all application containers are running. Then check the traffic generator:
+
+```bash
+docker compose logs --tail=100 traffic-generator
+```
+
+Check the service list directly:
+
+```bash
+curl -s http://localhost:16686/api/services | jq
+```
+
+Restart and rebuild the application services:
+
+```bash
+docker compose up -d --build
+```
+
+If old trace data makes the graph confusing, restart Jaeger:
+
+```bash
+docker compose restart jaeger otel-collector
+```
 
 ## Scope and limitations
 
-This is a local observability simulation, not a production banking system. The application uses in-memory account data, has no authentication, does not implement durable transactions, and does not provide production-grade security or high availability. It is intended for telemetry generation and analysis experiments.
+This is a local telemetry simulation, not a production banking system. Services use in-memory behavior, there is no authentication or authorization, transactions are not durable, and the platform does not model production security, persistence, or high availability. It is intended for observability, anomaly detection, and bottleneck-analysis experiments.
