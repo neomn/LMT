@@ -407,6 +407,11 @@ services:
       SERVICE_ROLE: workload-generator
       TARGETS: api-gateway,ipg,switch,esb,core-banking,mobile-banking,internet-banking,branch-channel,atm-channel,customer-service,account-service,ledger-service,balance-service,transaction-service,payment-service,transfer-service,card-service,atm-service,bill-payment-service,fraud-service,aml-service,risk-engine,notification-service,reconciliation-service,settlement-service,reporting-service,statement-service,identity-service,audit-service
       OTEL_SERVICE_NAME: traffic-generator
+      CHAOS_AUTO_ENABLED: "true"
+      CHAOS_INTERVAL_SECONDS: "60"
+      CHAOS_DURATION_SECONDS: "25"
+    ports:
+      - "18089:8080"
     depends_on:
       api-gateway:
         condition: service_started
